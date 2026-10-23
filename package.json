@@ -14,7 +14,7 @@
   "author": "gcoder1991",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/gcoder1991/pi-cross-session.git"
+    "url": "git+https://github.com/zhaochunqi/pi-cross-session.git"
   },
   "engines": {
     "node": ">=22.19.0"

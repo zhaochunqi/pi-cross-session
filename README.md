@@ -1,12 +1,16 @@
 # pi-cross-session
 
 > This fork keeps the upstream online session transport but changes pending-message retention: ordinary queued messages have no queue TTL and survive cancellation until explicit local resume. It remains an in-memory, online-only queue—there is no disk spool or recovery after reload/process exit.
+>
+> Upstream: [gcoder1991/pi-cross-session](https://github.com/gcoder1991/pi-cross-session). Do not mix both sources on one machine — the same extension would load twice.
 
 Pi ↔ Pi same-machine cross-session messaging. Lets independent [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) coding-agent sessions on one machine discover each other and exchange plain-text peer messages over per-instance IPC (Unix domain socket on macOS/Linux, named pipe on Windows) — no daemon, no database, zero runtime dependencies beyond Node's standard library.
 
 Inspired by Claude Code's cross-session messaging; copies its product semantics (accept/refuse inbound policy, `name [ref]` disambiguation, collapsed message UI, "a peer message is never user approval"), not its wire protocol.
 
 ## Install
+
+Install this fork, not the npm upstream (`npm:pi-cross-session` is upstream 2.3.0 without the queue change):
 
 ```bash
 pi install git:github.com/zhaochunqi/pi-cross-session
