@@ -112,3 +112,47 @@ test('real SDK tool_call: peer-only turn blocks fixture Agent entry; actual user
     console.log(JSON.stringify({ evidence: 'real SDK tool preflight/inert fixture Agent', calls: 4, peerExecutions: 0, userExecutions: 1, noChildCreated: true }));
   } finally { await b.close(); await a.close(); }
 });
+
+test('real SDK: busy steer joins the running turn instead of waiting for the whole run', { timeout: 20000 }, async () => {
+  const a = await make('steer-RT-A'), b = await make('steer-RT-B');
+  const gate = hold(); b.setGate(gate); let prompt;
+  try {
+    prompt = b.session.prompt('USER_BUSY', { source: 'interactive' });
+    await until(() => b.calls.length === 1);
+    const receipt = await send(a, b, 'PEER_STEER', 'steer');
+    assert.equal(receipt.details.status, 'steered');
+    assert.equal(b.session.agent.hasQueuedMessages(), true, 'an explicit steer uses the SDK steering queue');
+    assert.equal(hasPeer(b, 'PEER_STEER'), false, 'never injected before the current assistant turn ends');
+
+    gate.release(); await prompt;
+    await until(() => b.session.isIdle);
+    assert.equal(b.calls.length, 2, 'one follow-up request carries the steered text');
+    assert.ok(hasPeer(b, 'PEER_STEER'));
+    assert.match(JSON.stringify(b.calls[1].messages), /PEER_STEER/);
+    assert.equal(b.session.agent.hasQueuedMessages(), false);
+    assert.deepEqual(a.errors, []); assert.deepEqual(b.errors, []);
+    console.log(JSON.stringify({ evidence: 'real SDK busy steer', calls: b.calls.length, steered: true }));
+  } finally { gate.release(); await prompt?.catch(() => {}); await b.close(); await a.close(); }
+});
+
+test('real SDK: a steer retained across abort never reopens ingress by itself', { timeout: 20000 }, async () => {
+  const a = await make('steer-AB-A'), b = await make('steer-AB-B');
+  const gate = hold(); b.setGate(gate); let prompt;
+  try {
+    prompt = b.session.prompt('USER_BUSY', { source: 'interactive' });
+    await until(() => b.calls.length === 1);
+    assert.equal((await send(a, b, 'PEER_RETAINED', 'steer')).details.status, 'steered');
+
+    // The user aborts. The SDK keeps its steering queue, so the message may still
+    // surface later; that must not re-authorize peer reception.
+    await b.session.abort();
+    gate.release(); await prompt.catch(() => {}); await sleep(100);
+    await assert.rejects(send(a, b, 'peer after abort'), e => e.code === 'stopped');
+
+    await command(b, 'USER_AFTER_ABORT').catch(() => {});
+    assert.ok(b.session.sessionManager.getEntries().every(e => e.type !== 'custom_message' || e.details?.text !== 'peer after abort'));
+    await assert.rejects(send(a, b, 'retained steer does not reopen ingress'), e => e.code === 'stopped');
+    assert.deepEqual(a.errors, []); assert.deepEqual(b.errors, []);
+    console.log(JSON.stringify({ evidence: 'real SDK retained steer after abort', calls: b.calls.length, ingressReopened: false }));
+  } finally { gate.release(); await prompt?.catch(() => {}); await b.close(); await a.close(); }
+});

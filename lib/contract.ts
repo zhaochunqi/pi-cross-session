@@ -1,5 +1,9 @@
 // Thin Host EventBus contract. No tool execution, persistence, mapping, or retries.
 export const CAPABILITY = "cancel-safe-queue-v1";
+// Opt-in busy delivery into the receiver's running turn. Receivers that lack it
+// must answer `unsupported`; a steering send never silently degrades to queueing.
+export const STEER_CAPABILITY = "busy-steer-v1";
+export type Delivery = "steer" | "queue";
 export const RPC_SEND = "cross-session:rpc:send";
 export const RPC_INFO = "cross-session:rpc:info";
 export const RECEIVED = "cross-session:received";
@@ -16,7 +20,7 @@ export type BridgeEnvelope = {
 };
 export type SendRequest = {
   version: 1; requestId: string; local: Identity; remoteInstanceId: string;
-  messageId: string; text: string; summary?: string;
+  messageId: string; text: string; summary?: string; delivery?: Delivery;
 };
 export type EventBus = {
   emit(topic: string, data: unknown): void;

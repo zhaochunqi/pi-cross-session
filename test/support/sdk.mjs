@@ -65,6 +65,6 @@ export async function make(name, { inbound = 'accept', rpc = false, managed = fa
   };
 }
 export function tool(x, name) { return x.session.extensionRunner.getAllRegisteredTools().find(t => t.definition.name === name).definition; }
-export async function send(a, b, text) { return tool(a, 'send_pi_message').execute(randomUUID(), { target: b.peer.instanceId, message: text }, undefined, undefined, a.session.extensionRunner.createContext()); }
+export async function send(a, b, text, delivery = 'queue') { return tool(a, 'send_pi_message').execute(randomUUID(), { target: b.peer.instanceId, message: text, delivery }, undefined, undefined, a.session.extensionRunner.createContext()); }
 export const hasPeer = (x, text) => x.session.agent.state.messages.some(m => m.role === 'custom' && m.details?.text === text);
 export async function command(x, text) { await x.session.prompt(text, { source: 'interactive' }); }

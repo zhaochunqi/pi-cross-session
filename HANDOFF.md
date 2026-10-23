@@ -1,6 +1,8 @@
 # Cross-session core / Host RPC handoff
 
-> 本 fork 当前改动只涉及在线内存队列：普通 pending 不再有 queue TTL；abort 暂停但保留，显式 resume 串行重放；新 Pi 在 `agent_settled.aborted === false` 时允许 `error/length` 后继续，旧 SDK 保守暂停。goal 撤销仍删除 scoped pending。没有新增磁盘 spool，reload / shutdown / 进程退出后队列不恢复。下文保留上游验收记录；第 1 节已按本 fork 更新，历史测试数字不代表本 fork 最新结果。
+> **本 fork 第三批（busy steer）**：新增能力 `busy-steer-v1` 与消息级 `delivery`。默认自动模式在支持的对端上走 SDK steering 队列（当前 assistant turn / 工具批次结束后注入），在不支持的对端上降级为排队并在回执文本里说明；显式 `delivery: "steer"` 对无能力对端硬失败 `unsupported`，不静默降级。接收方对绑定在本机活跃 `peer_goal` 里的成员（子→父汇报）强制排队。abort 无法清 SDK steering 队列（`clearQueue` 只在 UI/RPC 侧），已 steer 的 key 记入 `cancelledSteer`，后续若被注入则在 `message_start` 把 provenance 降为 `peer` 并通知用户，敏感工具（`Agent`/`mesh`/`send_subagent`/`peer_goal` 写）保持阻断。**已跑**：`tsc --noEmit`、本机 Node 24.22.1 下完整 `node --test` **118/118 pass**（含新增 6 项：4 component/IPC、2 真实 SDK）。**未跑**：作者原 Node 22.23.1 矩阵、纯 SDK 0.83 fixture、smoke。下面第一段顶注仍是上一批的记录。
+>
+> 本 fork 第二批改动只涉及在线内存队列：普通 pending 不再有 queue TTL；abort 暂停但保留，显式 resume 串行重放；新 Pi 在 `agent_settled.aborted === false` 时允许 `error/length` 后继续，旧 SDK 保守暂停。goal 撤销仍删除 scoped pending。没有新增磁盘 spool，reload / shutdown / 进程退出后队列不恢复。下文保留上游验收记录；第 1 节已按本 fork 更新，历史测试数字不代表本 fork 最新结果。
 
 范围：只改 `pi-cross-session`。当前第二轮修复 **F1/F2 两项 P1 + 跨 SDK RPC 测试契约**，最终证据见第 7 节（待主审复核）；第 5/6 节保留历史批次证据，不代表当前 SDK 矩阵。基线 HEAD `d2eb1bc`，原仓库安装树 SDK **0.84.4**，另以 fresh 私有 source-hash fixture 验证已装 **0.83.0**，未改原版本声明或依赖。
 没有提交、push、stash、安装、联网、依赖版本变更、真实用户 session/peer/凭据访问；没有启动子代理。
@@ -49,7 +51,9 @@ message = {
 
 ### 队列、取消和来源
 
-- 每 incarnation 最多 50 条待提交消息；pending 没有 queue TTL，但只存在内存中，reload/shutdown/进程退出即丢失。wire `sentAt` 仍要求 30s 内，未来 clock skew 最多 5s。
+- 每 incarnation 最多 50 条待提交消息（队列与已 steer 未注入合计）；pending 没有 queue TTL，但只存在内存中，reload/shutdown/进程退出即丢失。wire `sentAt` 仍要求 30s 内，未来 clock skew 最多 5s。
+- **`delivery: "steer"` 不再等 settled**：在已确认 `phase === "busy"` + active signal + 来源确认时直接 `pi.sendMessage(..., deliverAs: "steer")`，由 SDK 在当前 assistant turn 结束后注入；回执状态为 `steered`（不是已执行，也不是用户授权）。绝对不 relabel 正在跑的 turn：注入时 `message_start` 把 provenance 降为 `peer`，`notificationTurn` 不置位。
+- 无 `delivery` 字段（自动）由发送端在 hello 后按对端 `busy-steer-v1` 决定；显式 `steer` 缺能力则 `unsupported`。绑定在本机活跃 goal 的成员（子→父）即使请求 steer 也只排队。
 - 不再把 busy 消息交给 SDK steer：通常在最近一次 low-level run 观测到 assistant `message_end.stopReason="stop"`、非取消、signal/来源已确认的 `agent_settled` 后，下一个 event-loop gate 重验 idle/epoch，再提交 **一条**。新 Pi 另可用 `agent_settled.aborted === false` 精确区分终止 `error/length`：撤销旧 turn 权限后继续下一条；旧 SDK 无此字段时保守暂停。
 - 从同步提交到 agent_start 的窗口设为 preflight，不能因 `isIdle()` 暂 true 把第二条漏入 SDK queue。
 - agent_start 捕获 signal 并注册 abort listener；signal abort 或 assistant aborted 证据都会 stop latch。普通未提交队列保留到显式 resume；unknown/internal abort 也保守 latch。goal 撤销仍通过 `revokeGoal` 删除 scoped pending。

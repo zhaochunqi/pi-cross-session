@@ -30,7 +30,7 @@ export async function component(name, options = {}) {
   };
   return x;
 }
-export function hello(a, b, safe = true) { return { v: 1, type: 'hello', requestId: randomUUID(), token: b.peer.token, target: { id: b.peer.id, instanceId: b.peer.instanceId }, ...(a && { from: { id: a.peer.id, instanceId: a.peer.instanceId, token: a.peer.token } }), ...(safe && { capabilities: ['cancel-safe-queue-v1'] }) }; }
+export function hello(a, b, safe = true, capabilities = ['cancel-safe-queue-v1', 'busy-steer-v1']) { return { v: 1, type: 'hello', requestId: randomUUID(), token: b.peer.token, target: { id: b.peer.id, instanceId: b.peer.instanceId }, ...(a && { from: { id: a.peer.id, instanceId: a.peer.instanceId, token: a.peer.token } }), ...(safe && { capabilities }) }; }
 export function message(text = 'hello', overrides = {}) { return { v: 1, type: 'message', requestId: randomUUID(), messageId: randomUUID(), text, summary: 'fixture', sentAt: Date.now(), ...overrides }; }
 export async function wire(a, b, frame = message(), options = {}) {
   const socket = net.createConnection({ path: b.peer.socketPath });

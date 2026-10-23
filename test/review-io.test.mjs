@@ -183,3 +183,18 @@ test('review component: unknown endings pause with retained queue; cancelled/pee
     assert.equal((await wire(a, b, message('unknown continuation cannot reopen'))).status, 'stopped');
   } finally { await b.close(); await a.close(); }
 });
+
+test('review older receiver: automatic delivery downgrades to queue, explicit steer is refused', async () => {
+  const a = await component('downgrade-a'), b = await component('downgrade-b');
+  try {
+    await fakePeer(a, b, (s, f) => s.write(JSON.stringify({ v: 1, type: 'response', requestId: f.requestId, ok: true, status: 'queued', peer: { id: b.peer.id, instanceId: b.peer.instanceId, pid: process.pid } }) + '\n'), async counts => {
+      const auto = await a.tool('send_pi_message', { target: b.peer.instanceId, message: 'auto delivery' });
+      assert.equal(auto.details.status, 'queued');
+      assert.match(auto.content[0].text, /sent as queue/);
+      const explicit = await a.tool('send_pi_message', { target: b.peer.instanceId, message: 'hard steer', delivery: 'queue' });
+      assert.equal(explicit.details.status, 'queued');
+      await assert.rejects(a.tool('send_pi_message', { target: b.peer.instanceId, message: 'steer required', delivery: 'steer' }), e => e.code === 'unsupported');
+      assert.equal(counts().sends, 2, 'the refused steer is never written to the receiver');
+    });
+  } finally { await b.close(); await a.close(); }
+});
