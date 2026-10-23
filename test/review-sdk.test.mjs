@@ -31,27 +31,59 @@ test('review real SDK: 20 ordinary completion turns stay authorized without gran
   } finally { await b.close(); await a.close(); }
 });
 
-test('review real SDK DEFAULT retry: abort in actual backoff drops two queued peers without replay', { timeout: 15000 }, async () => {
+test('review real SDK: terminal error continues queue only with explicit non-abort settlement', async () => {
+  const a = await make('terminal-error-A'), b = await make('terminal-error-B', { rpc: true });
+  const settlements = [];
+  b.session.subscribe(event => { if (event.type === 'agent_settled') settlements.push(event); });
+  const gate = hold();
+  try {
+    b.setGate(gate); b.setError('terminal fixture error');
+    const prompt = command(b, 'user request ends with a provider error');
+    await until(() => b.calls.length === 1);
+    assert.equal((await send(a, b, 'QUEUED_AFTER_TERMINAL_ERROR')).details.status, 'queued');
+    gate.release(); await prompt; await sleep(100);
+    const aborted = settlements.at(-1)?.aborted;
+    if (aborted === false) {
+      await until(() => b.calls.length === 2 && b.session.isIdle, 'explicitly non-aborted error flushes the successor');
+      assert.equal(info(b).stopped, false);
+      assert.equal(hasPeer(b, 'QUEUED_AFTER_TERMINAL_ERROR'), true);
+    } else {
+      assert.equal(aborted, undefined, 'old SDK has no exact cancellation bit and must pause conservatively');
+      assert.equal(b.calls.length, 1); assert.equal(info(b).stopped, true);
+      assert.equal(hasPeer(b, 'QUEUED_AFTER_TERMINAL_ERROR'), false);
+      await command(b, '/cross-session-resume');
+      await until(() => b.calls.length === 2 && b.session.isIdle, 'old SDK resumes retained successor explicitly');
+    }
+    assert.equal(info(b).states[0].state, 'submitted');
+    assert.deepEqual(b.errors, []);
+    console.log(JSON.stringify({ evidence: 'real SDK terminal-error settlement', exactAbortSignal: aborted !== undefined, calls: b.calls.length }));
+  } finally { gate.release(); await b.session.abort(); await b.close(); await a.close(); }
+});
+
+test('review real SDK DEFAULT retry: abort in actual backoff retains two peers until explicit resume', { timeout: 15000 }, async () => {
   const a = await make('retry-abort-A'), b = await make('retry-abort-B', { retry: true, rpc: true });
   const gate = hold(); b.setGate(gate); b.setError('503 overloaded fixture'); let prompt;
   try {
     assert.equal(b.session.autoRetryEnabled, true);
     prompt = command(b, 'real user starts erroring request');
     await until(() => b.calls.length === 1);
-    for (const text of ['DROP_RETRY_ONE', 'DROP_RETRY_TWO']) assert.equal((await send(a, b, text)).details.status, 'queued');
+    for (const text of ['RETAIN_RETRY_ONE', 'RETAIN_RETRY_TWO']) assert.equal((await send(a, b, text)).details.status, 'queued');
     gate.release(); await until(() => b.events.includes('auto_retry_start') && b.session.isRetrying, 'actual SDK retry backoff');
     await b.session.abort(); await prompt; await sleep(150);
     console.log(JSON.stringify({ evidence: 'default retry backoff abort', callsAfterAbort: b.calls.length, oldSignalAborted: b.calls[0].signal.aborted, states: info(b).states.map(s => s.state) }));
     assert.equal(b.calls[0].signal.aborted, false, 'SDK old agent signal is NOT the retry controller');
     assert.equal(b.calls.length, 1, 'zero automatic successor provider calls');
-    assert.ok(info(b).stopped); assert.deepEqual(info(b).states.map(s => s.state), ['dropped_cancelled', 'dropped_cancelled']);
+    assert.ok(info(b).stopped); assert.deepEqual(info(b).states.map(s => s.state), ['queued', 'queued']);
     await command(b, 'new genuine user WITHOUT reopen');
     await assert.rejects(send(a, b, 'still closed'), e => e.code === 'stopped');
-    await command(b, '/cross-session-resume'); await command(b, 'another user after reopen'); await sleep(100);
-    assert.equal(b.calls.length, 3);
-    for (const text of ['DROP_RETRY_ONE', 'DROP_RETRY_TWO']) { assert.equal(hasPeer(b, text), false); assert.ok(!JSON.stringify(b.calls.slice(1)).includes(text)); }
+    assert.equal(b.calls.length, 2);
+    for (const text of ['RETAIN_RETRY_ONE', 'RETAIN_RETRY_TWO']) assert.equal(hasPeer(b, text), false);
+    await command(b, '/cross-session-resume');
+    await until(() => b.calls.length === 4 && b.session.isIdle, 'both retained peers replay serially');
+    for (const text of ['RETAIN_RETRY_ONE', 'RETAIN_RETRY_TWO']) assert.equal(hasPeer(b, text), true);
+    assert.deepEqual(info(b).states.map(s => s.state), ['submitted', 'submitted']);
     assert.deepEqual(b.errors, []);
-    console.log(JSON.stringify({ evidence: 'retry abort no replay with user/reopen', calls: b.calls.length, errors: 1, successors: 0 }));
+    console.log(JSON.stringify({ evidence: 'retry abort replays only after explicit resume', calls: b.calls.length, errors: 1 }));
   } finally { gate.release(); await b.session.abort(); await prompt?.catch(() => {}); await b.close(); await a.close(); }
 });
 

@@ -21,7 +21,7 @@ const MAX_MESSAGE_CHARS = 1_000_000;
 const MAX_REGISTRATION_BYTES = 64 * 1024;
 const MAX_PENDING = 50;
 const TOTAL_BUDGET = 256;
-const QUEUE_TTL_MS = 30_000;
+const MAX_MESSAGE_AGE_MS = 30_000;
 const MAX_TRACKED_SENDERS = 256;
 const MAX_SEEN_MESSAGES = 512;
 const RATE_CAPACITY = 30;
@@ -476,6 +476,7 @@ export default function (pi: ExtensionAPI) {
   let turnCancelled = false;
   let notificationTurn = false; // Trusted in-process extension notification drives the current logical turn.
   let terminalSuccess = false;
+  let terminalStopReason: string | undefined;
   let phase: "idle" | "preflight" | "busy" = "idle";
   const continuations = new MeshContinuations();
   const goals = new PeerGoals(() => currentCtx?.sessionManager.getEntries() ?? [], data => pi.appendEntry(GOAL_ENTRY, data));
@@ -505,7 +506,7 @@ export default function (pi: ExtensionAPI) {
   const rpcCancels = new Set<() => void>();
   type RecordState = { messageId: string; source: string; state: string; updatedAt: number; diagnostic?: string };
   const statuses = new Map<string, RecordState>();
-  type Pending = { details: IncomingDetails; key: string; expiresAt: number; timer: NodeJS.Timeout };
+  type Pending = { details: IncomingDetails; key: string };
   const pending: Pending[] = [];
   let submittedKey: string | undefined;
   let submissionTimer: NodeJS.Timeout | undefined;
@@ -531,12 +532,18 @@ export default function (pi: ExtensionAPI) {
   function dropPending(key: string, reason: string) {
     const i = pending.findIndex(entry => entry.key === key);
     if (i < 0) return;
-    const [entry] = pending.splice(i, 1); clearTimeout(entry.timer);
+    pending.splice(i, 1);
     status(key, reason);
   }
   function latch() {
+    // Abort/unknown outcomes pause ingress. Ordinary pending messages survive in
+    // memory until explicit local resume; revokeGoal still drops scoped work.
     stopped = true; turnCancelled = true; notificationTurn = false; revokeGoal();
-    for (const entry of [...pending]) dropPending(entry.key, "dropped_cancelled");
+  }
+  function fenceObservedFailure() {
+    // An observed provider error/length ending revokes the old turn's authority,
+    // but it is not a user cancellation and must not permanently close ingress.
+    turnCancelled = true; notificationTurn = false; revokeGoal();
   }
   function submit(details: IncomingDetails, key: string) {
     if (shuttingDown || stopped || phase !== "idle" || !currentCtx?.isIdle() || activeSignal) {
@@ -550,7 +557,7 @@ export default function (pi: ExtensionAPI) {
     // A published registration can be discovered before its startup await ends.
     authoritySessionId = current?.id;
     peerTurn = details;
-    phase = "preflight"; provenance = "peer"; turnCancelled = false; terminalSuccess = false; epoch++; submittedKey = key;
+    phase = "preflight"; provenance = "peer"; turnCancelled = false; terminalSuccess = false; terminalStopReason = undefined; epoch++; submittedKey = key;
     try {
       const goal = activePeerGoal();
       const authority = goal
@@ -570,6 +577,19 @@ export default function (pi: ExtensionAPI) {
       status(key, "injection_failed", String(error)); latch();
       throw error;
     }
+  }
+  function scheduleFlush(ctx: ExtensionContext, expectedEpoch: number) {
+    clearTimeout(flushTimer);
+    flushTimer = undefined;
+    if (!pending.length) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = undefined;
+      if (expectedEpoch !== epoch || stopped || shuttingDown || phase !== "idle" || activeSignal || !ctx.isIdle()) return;
+      const entry = pending.shift();
+      if (!entry) return;
+      try { submit(entry.details, entry.key); } catch { /* status records synchronous error */ }
+    }, 0);
+    flushTimer.unref();
   }
   function beforeExit() { void cleanup(); }
   function cleanup(): Promise<void> {
@@ -787,8 +807,8 @@ export default function (pi: ExtensionAPI) {
       if (!value.text.trim()) return reject(value.requestId, "invalid_message", "Message text must not be empty");
       if (codePointLength(value.summary) > 200) return reject(value.requestId, "invalid_message", "Message summary exceeds 200 characters");
       if (inboundMode() === "refuse") return reject(value.requestId, "refused", "Recipient is not accepting cross-session messages");
-      if (stopped) return reject(value.requestId, "stopped", "Observed cancellation; local user must run /cross-session-resume (dropped messages never replay)");
-      if (Date.now() - value.sentAt > QUEUE_TTL_MS || value.sentAt > Date.now() + 5_000) return reject(value.requestId, "expired", "Message timestamp is expired or in the future; inspect clocks, do not auto-retry");
+      if (stopped) return reject(value.requestId, "stopped", "Observed cancellation; local user must run /cross-session-resume to replay retained messages");
+      if (Date.now() - value.sentAt > MAX_MESSAGE_AGE_MS || value.sentAt > Date.now() + 5_000) return reject(value.requestId, "expired", "Message timestamp is expired or in the future; inspect clocks, do not auto-retry");
       let bridge;
       try { bridge = bridgeEnvelope(value.text); } catch (error) { return reject(value.requestId, "invalid_bridge", String(error)); }
       if (bridge && value.goalId) return reject(value.requestId, "invalid_goal", "Goal-scoped messages cannot use bridge routing");
@@ -842,9 +862,9 @@ export default function (pi: ExtensionAPI) {
         if (phase !== "busy" || activeSignal !== admittedSignal || !admittedSignal || admittedSignal.aborted) {
           status(key, "dropped_cancelled"); return reject(value.requestId, "busy", "Active signal changed during admission; no SDK submission");
         }
-        const expiresAt = Math.min(Date.now() + QUEUE_TTL_MS, value.sentAt + QUEUE_TTL_MS);
-        const timer = setTimeout(() => dropPending(key, "expired"), Math.max(1, expiresAt - Date.now())); timer.unref();
-        pending.push({ details, key, expiresAt, timer });
+        // No queue TTL: this is an online-only queue, not an expiring spool.
+        // The 50-entry bound still applies and process shutdown/reload drops it.
+        pending.push({ details, key });
         status(key, "queued");
       }
       response(socket, value.requestId, true, handled ? "accepted" : canSubmit ? "submitted" : "queued");
@@ -1130,7 +1150,7 @@ export default function (pi: ExtensionAPI) {
       if (managed) { shuttingDown = true; return; }
       process.on("beforeExit", beforeExit);
       installRpc();
-      stopped = false; turnCancelled = false; terminalSuccess = false; phase = ctx.isIdle() ? "idle" : "preflight"; provenance = "unknown"; inputSource = "unknown";
+      stopped = false; turnCancelled = false; terminalSuccess = false; terminalStopReason = undefined; phase = ctx.isIdle() ? "idle" : "preflight"; provenance = "unknown"; inputSource = "unknown";
       budget = TOTAL_BUDGET; statuses.clear(); rpcRequests.clear();
       currentCtx = ctx;
       if (ctx.mode === "tui") {
@@ -1220,6 +1240,7 @@ export default function (pi: ExtensionAPI) {
     // agent_start is low-level: internal retry/continuation inherits logical authority.
     if (phase !== "busy" && provenance !== "peer") provenance = inputSource;
     terminalSuccess = false;
+    terminalStopReason = undefined;
     inputSource = "unknown";
     phase = "busy"; epoch++;
     unwatch(); activeSignal = ctx.signal;
@@ -1246,6 +1267,7 @@ export default function (pi: ExtensionAPI) {
     if (!observes(ctx)) return;
     const message = event.message;
     if (message.role === "assistant") {
+      terminalStopReason = message.stopReason;
       terminalSuccess = message.stopReason === "stop"; // Errors revoke old-signal safe completion.
       if (message.stopReason === "aborted") latch();
     }
@@ -1261,8 +1283,18 @@ export default function (pi: ExtensionAPI) {
     // stopped fences peer reception, not a fresh user-authorized logical turn.
     // Keep that old inbox latch closed without revoking the new turn's plans.
     // Ordinary completion notifications are trusted even without a Mesh permit.
-    const safe = terminalSuccess && !!activeSignal && !activeSignal.aborted && (provenance !== "unknown" || notificationTurn) && !turnCancelled;
-    if (!safe) latch(); // Includes error/backoff cancellation and unobserved terminal outcome.
+    // Newer Pi exposes the exact cancellation bit. Older SDKs do not: an error
+    // followed by retry-backoff abort is indistinguishable from a terminal error
+    // there, so those runtimes must retain the conservative pause fallback.
+    const settledAborted = (_event as { aborted?: boolean }).aborted;
+    const safe = settledAborted !== true && terminalSuccess && !!activeSignal && !activeSignal.aborted && (provenance !== "unknown" || notificationTurn) && !turnCancelled;
+    const continuableFailure = settledAborted === false && !!activeSignal && !activeSignal.aborted && (terminalStopReason === "error" || terminalStopReason === "length");
+    if (!safe) {
+      // Error/length is not Esc only when the runtime explicitly says non-abort:
+      // revoke the old authority but keep ingress open. All unknown shapes pause.
+      if (continuableFailure && !stopped && !turnCancelled && !activeSignal?.aborted) fenceObservedFailure();
+      else latch();
+    }
     unwatch(); unwatch = () => {}; activeSignal = undefined;
     continuations.settle();
     phase = "idle"; provenance = "unknown"; submittedKey = undefined; notificationTurn = false;
@@ -1270,19 +1302,9 @@ export default function (pi: ExtensionAPI) {
     const settledEpoch = ++epoch;
     setCurrent(ctx, { status: "idle" });
     await writeRegistration(ctx);
-    // Do not submit inside the old SDK run's awaited lifecycle stack.
-    if (safe && !stopped && !shuttingDown) {
-      flushTimer = setTimeout(() => {
-        flushTimer = undefined;
-        if (epoch !== settledEpoch || stopped || shuttingDown || phase !== "idle" || !ctx.isIdle()) return;
-        while (pending.length) {
-          const entry = pending.shift()!; clearTimeout(entry.timer);
-          if (entry.expiresAt <= Date.now()) { status(entry.key, "expired"); continue; }
-          try { submit(entry.details, entry.key); } catch { /* status records synchronous error */ }
-          break; // One SDK submission per observed safe settled gate.
-        }
-      }, 0);
-    }
+    // Do not submit inside the old SDK run's awaited lifecycle stack. A failed
+    // submitted turn is never replayed; only its not-yet-submitted successors flush.
+    if ((safe || continuableFailure) && !stopped && !shuttingDown) scheduleFlush(ctx, settledEpoch);
   });
   pi.on("tool_call", (event, ctx) => {
     if (!observes(ctx)) return;
@@ -1318,13 +1340,16 @@ export default function (pi: ExtensionAPI) {
     if (observes(ctx) && !event.isError) goals.record(event.toolCallId, event.toolName, event.details);
   });
   pi.registerCommand("cross-session-resume", {
-    description: "Explicit local user reopens peer admission after observed cancellation; never replays dropped messages",
+    description: "Explicit local user reopens peer admission and replays retained pending messages",
     handler: async (_args, ctx) => {
       if (!ctx.isIdle() || activeSignal) { ctx.ui.notify("Wait until the current turn has settled", "warning"); return; }
-      for (const entry of [...pending]) dropPending(entry.key, "dropped_user_reset");
+      currentCtx = ctx;
       clearTimeout(submissionTimer); submissionTimer = undefined;
       phase = "idle"; provenance = "unknown"; inputSource = "unknown"; submittedKey = undefined; notificationTurn = false; epoch++;
-      stopped = false; ctx.ui.notify("Peer admission reopened; dropped messages are not replayed and budget is not refilled", "info");
+      stopped = false;
+      const retained = pending.length;
+      ctx.ui.notify(`Peer admission reopened; ${retained} retained message(s) queued for replay; budget is not refilled`, "info");
+      scheduleFlush(ctx, epoch);
     },
   });
   pi.registerCommand("cross-session-status", {

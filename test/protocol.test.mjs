@@ -103,15 +103,19 @@ test('component/IPC: queue MAX_PENDING=50, short rate, status and total non-refi
   } finally { await b.close(); await c.close(); await a.close(); }
 });
 
-test('component/IPC: queued TTL and shutdown/heartbeat synchronous getter failure (real 31s)', { timeout: 40000 }, async () => fixtures(async (a, b) => {
-  await b.busy(); const m = message('expire'); assert.equal((await wire(a, b, m)).status, 'queued');
+test('component/IPC: queue outlives wire freshness; heartbeat getter failure still cleans up (real 31s)', { timeout: 40000 }, async () => fixtures(async (a, b) => {
+  await b.busy(); const m = message('retain beyond 30s'); assert.equal((await wire(a, b, m)).status, 'queued');
   a.runtime.getSessionName = () => { throw Error('stale synchronous getter'); };
   await sleep(31_100);
   assert.equal((await wire(undefined, b, null)).status, 'ready');
   assert.equal((await wire(b, b, { v: 1, type: 'status', requestId: randomUUID(), messageId: m.messageId })).status, 'unknown', 'status source-qualified');
-  assert.equal(info(b).states[0].state, 'expired');
+  assert.equal(info(b).states[0].state, 'queued');
+  assert.equal((await wire(b, b, message('stale wire timestamp', { sentAt: Date.now() - 31_000 }))).status, 'expired');
   assert.ok(!registrations().some(p => p.instanceId === a.peer.instanceId)); assert.ok(!fs.existsSync(a.peer.socketPath));
   assert.equal(b.calls.length, 0);
+  await b.settled();
+  assert.equal(b.calls.length, 1); assert.ok(b.calls[0].message.content.includes('retain beyond 30s'));
+  assert.equal(info(b).states[0].state, 'submitted');
 }, { rpc: true }));
 
 for (const capabilities of [[], ['cancel-safe-queue-v1']]) test(`component/IPC: new sender refuses missing ${capabilities.length ? 'goal' : 'queue'} capability BEFORE message frame`, async () => fixtures(async (a, b) => {

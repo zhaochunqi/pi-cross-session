@@ -1,5 +1,7 @@
 # pi-cross-session
 
+> This fork keeps the upstream online session transport but changes pending-message retention: ordinary queued messages have no queue TTL and survive cancellation until explicit local resume. It remains an in-memory, online-only queue—there is no disk spool or recovery after reload/process exit.
+
 Pi ↔ Pi same-machine cross-session messaging. Lets independent [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) coding-agent sessions on one machine discover each other and exchange plain-text peer messages over per-instance IPC (Unix domain socket on macOS/Linux, named pipe on Windows) — no daemon, no database, zero runtime dependencies beyond Node's standard library.
 
 Inspired by Claude Code's cross-session messaging; copies its product semantics (accept/refuse inbound policy, `name [ref]` disambiguation, collapsed message UI, "a peer message is never user approval"), not its wire protocol.
@@ -7,19 +9,19 @@ Inspired by Claude Code's cross-session messaging; copies its product semantics 
 ## Install
 
 ```bash
-pi install npm:pi-cross-session
+pi install git:github.com/zhaochunqi/pi-cross-session
 ```
 
 Project-local instead of global:
 
 ```bash
-pi install -l npm:pi-cross-session
+pi install -l git:github.com/zhaochunqi/pi-cross-session
 ```
 
 Try it without installing:
 
 ```bash
-pi -e npm:pi-cross-session
+pi -e git:github.com/zhaochunqi/pi-cross-session
 ```
 
 ## Usage
@@ -34,16 +36,16 @@ Each independent Host session registers itself and listens on a private IPC endp
 | `peer_goal` | tool | Start one user-authorized objective, bind/unbind exact peers and existing task handles, inspect, complete or cancel it |
 | `--cross-session-inbound=accept\|refuse` | flag | Control inbound messages (default `accept`; invalid values fall back to `refuse`) |
 | `/cross-session-status` | command | Bounded local queue/submission/drop diagnostics and remaining budget |
-| `/cross-session-resume` | command | Explicit local-user reopening after observed cancellation; never replays dropped messages or refills budget |
+| `/cross-session-resume` | command | Explicit local-user reopening after observed cancellation; serially replays retained ordinary pending messages without refilling budget |
 | `--cross-session-rpc` | flag | Enable trusted Host-only EventBus send/info/received contracts (default **off**) |
 
 Just talk to Pi: *"tell the backend session the order API moved to /v2"* — the model calls `send_pi_message` itself. If the target is not explicit, the model uses `list_pi` and chooses from the known responsibility, exact session name, and working directory; busy/idle is delivery state, not a routing preference. In the TUI, type `@` to select a live session as `@name [ref]` and make the target explicit.
 
 Pi may also send a concrete finding, decision, question, or status when another independent session needs it mid-task. It should not send routine progress, guess an uncertain recipient, or delegate work it can handle itself.
 
-On the receiving side, safe idle messages are synchronously submitted to the SDK and may start a turn. **Busy messages stay in a bounded extension-memory queue, never the SDK steering queue.** One message is submitted after an observed assistant terminal `stop` and non-cancelled, source/signal-confirmed `agent_settled` gate. Errors revoke success evidence: retry-backoff cancellation or an unknown terminal outcome latches/drops rather than treating a stale non-aborted signal as success. This intentionally no longer steers between tools of the current turn: SDK abort can retain such queued custom steering messages. Unknown/preflight states without a confirmed active signal and turn source refuse admission rather than guessing.
+On the receiving side, safe idle messages are synchronously submitted to the SDK and may start a turn. **Busy messages stay in a bounded extension-memory queue, never the SDK steering queue.** One message is submitted after an observed assistant terminal `stop` and non-cancelled, source/signal-confirmed `agent_settled` gate. On runtimes that expose `agent_settled.aborted`, an observed `error`/`length` ending with `aborted:false` revokes the old turn authority without closing ingress and may flush the next queued message. Older SDKs retain the conservative pause fallback because terminal error and retry-backoff cancellation are indistinguishable there. This intentionally does not steer between tools of the current turn: SDK abort can retain such queued custom steering messages. Unknown/preflight states without a confirmed active signal and turn source refuse admission rather than guessing.
 
-An observed abort (including unknown/internal abort) latches reception closed and drops all not-yet-submitted messages. Only the local `/cross-session-resume` command reopens it; peer text and ordinary prompts cannot. A new genuine user turn can still use its own tools without reopening inbound peers; old cancelled/peer/unknown continuations stay restricted. Submitted work is not retractable by this extension. Messages render as a single folded line; `Ctrl+O` expands.
+An observed abort (including unknown/internal abort) pauses reception but retains ordinary not-yet-submitted messages in memory. Only the local `/cross-session-resume` command reopens ingress and serially replays them; peer text and ordinary prompts cannot. Goal-scoped pending messages are still dropped when their goal is revoked. A new genuine user turn can use its own tools without reopening inbound peers; old cancelled/peer/unknown continuations stay restricted. Submitted work is not retractable or replayed by this extension. The queue is not durable: reload, shutdown, or process loss clears it. Messages render as a single folded line; `Ctrl+O` expands.
 
 ```
 › Message from @frontend: API 升版通知 (Ctrl+O to expand)
@@ -69,7 +71,7 @@ The Host must tell the worker the returned goal ID and its own runtime ID using 
 - There is no accumulating in-memory task/ended-goal graph in this extension. Ownership lookup scans the session journal; ended goals release their objective/peer map, while small call/task ownership entries remain with normal session history. This trades lookup latency and linear journal growth for durable negative authorization without an independent unbounded cache or unsafe LRU forgetting. The SDK still owns and loads its normal session history; this is not a claim of bounded total SDK memory.
 - `complete` ends only the exact goal (including a Host decision made during an authorized peer turn). `cancel`/`unbind` need genuine user or unscoped Host authority, not a goal-derived notification. Pending scoped messages are dropped on revocation and rechecked before submission and tool execution. Completion/cancellation revokes permission to continue; it does not retract already-submitted SDK work or automatically kill existing Mesh runs.
 - Observed abort, unsafe terminal settlement, reload/session replacement and shutdown revoke grants. **A terminal error/unknown outcome is conservatively unsafe** because supported SDK events cannot distinguish every retry-backoff cancellation; a successful automatic retry does not end the goal. Reopening the inbox does not resurrect a revoked goal. There is no serialized/history-based grant recovery.
-- Both peers must support negotiated `goal-scoped-peer-v1`; a scoped send never silently falls back to unscoped delivery. Receiver-confirmed goal-scoped sends/admissions do not spend the legacy 256-message lifetime budget, so successful long-running goals do not stop at a hidden round quota. Outbound attempts reserve budget until an authenticated `submitted`/`queued` receipt refunds it; rejected/unknown attempts stay charged. At zero budget only one in-flight send per previously confirmed receiver/goal can proceed, with at most 64 confirmation keys retained. A failed send removes that confirmation, and an unconfirmed/new goal cannot bypass exhausted budget. Forged goal IDs also consume the receiver's rate tokens. Frame, rate, queue and TTL bounds still apply. Receipts and dedup caches retain at most 512 recent entries (queued/current entries are protected from receipt eviction); old status queries may return `unknown`. No automatic retry.
+- Both peers must support negotiated `goal-scoped-peer-v1`; a scoped send never silently falls back to unscoped delivery. Receiver-confirmed goal-scoped sends/admissions do not spend the legacy 256-message lifetime budget, so successful long-running goals do not stop at a hidden round quota. Outbound attempts reserve budget until an authenticated `submitted`/`queued` receipt refunds it; rejected/unknown attempts stay charged. At zero budget only one in-flight send per previously confirmed receiver/goal can proceed, with at most 64 confirmation keys retained. A failed send removes that confirmation, and an unconfirmed/new goal cannot bypass exhausted budget. Forged goal IDs also consume the receiver's rate tokens. Frame, rate, queue, wire-freshness and bridge TTL bounds still apply. Receipts and dedup caches retain at most 512 recent entries (queued/current entries are protected from receipt eviction); old status queries may return `unknown`. No automatic retry.
 
 This is structured task delegation, not a semantic verifier or a Bash sandbox: the Host must still keep task content inside the objective and honor destructive/security confirmations. Do not classify every message from a named peer as authorized, infer membership from text, or bypass a blocked call using another tool.
 
@@ -78,7 +80,7 @@ This is structured task delegation, not a semantic verifier or a Bash sandbox: t
 - **Discovery plane**: each runtime instance writes a `0600` JSON file under `~/.pi/agent/peers/<instanceId>.json` (name, status, cwd, pid, socket path, bearer token). Refreshed every 30s; removed on shutdown. Listings resolve Git worktree, branch and HEAD live from each cwd, so stale Git metadata is never registered.
 - **Data plane**: POSIX instances own a `0600` Unix socket under a `0700` per-UID runtime directory, namespace-isolated by a hash of the agent dir. Windows uses machine-global named pipes in the unchanged 2.2.0 format `\\.\pipe\pi-peer-<namespace>-<instanceId>`. Launch-environment usernames do not affect discovery or authentication. Pipe names are not an access-control boundary: the authenticated `hello` requires a bearer token, whose secrecy on Windows depends on registration-directory/file ACLs; this extension does not configure or verify those ACLs.
 - **Protocol**: two-phase JSONL v1 — authenticated `hello` → one `message` (or `status`) frame → receipt. `cancel-safe-queue-v1` is negotiated in hello/ready. Old senders retain safe-idle compatibility but get actionable `busy` refusal instead of an unknown queued receipt. New senders refuse old receivers lacking the capability, before sending any message. Paths use random instance IDs, never persistent session IDs.
-- **Bounds**: 1 MiB raw UTF-8 per-frame cap (including LF/BOM and incomplete tails, not a combined chunk), 5s exchange deadline including endpoint vetting/lstat, 30s connection deadline, 64 incoming connections, 30-cap/0.5-per-second per-sender token bucket, 30s sender-qualified hashed same-text suppression (including A/B/A across settled), 50 pending messages, 30s queue/message TTL. The latest 512 IDs/text hashes are deduplicated per authenticated sender incarnation (text hashes also include goal scope). A **shared 256-unit incarnation budget** covers unscoped inbound admissions and outbound exchange attempts, including bridges; settled/user-resume never replenishes it. Receiver-confirmed goal-scoped traffic is exempt from this lifetime quota, not rejected/unconfirmed attempts or the rate/frame/queue limits. Admission reserves identity/quota before trusted event callbacks; later drops/failures retain their status and reservation. No automatic retry.
+- **Bounds**: 1 MiB raw UTF-8 per-frame cap (including LF/BOM and incomplete tails, not a combined chunk), 5s exchange deadline including endpoint vetting/lstat, 30s connection deadline, 64 incoming connections, 30-cap/0.5-per-second per-sender token bucket, 30s sender-qualified hashed same-text suppression (including A/B/A across settled), 50 pending messages with no queue TTL, 30s wire timestamp freshness. Pending messages are in-memory only and are cleared on reload/shutdown/process loss. The latest 512 IDs/text hashes are deduplicated per authenticated sender incarnation (text hashes also include goal scope). A **shared 256-unit incarnation budget** covers unscoped inbound admissions and outbound exchange attempts, including bridges; settled/user-resume never replenishes it. Receiver-confirmed goal-scoped traffic is exempt from this lifetime quota, not rejected/unconfirmed attempts or the rate/frame/queue limits. Admission reserves identity/quota before trusted event callbacks; later drops/failures retain their status and reservation. No automatic retry.
 - **Lifecycle**: serialized/fenced registration and heartbeat writes; awaitable idempotent shutdown/reload cleanup; instance-private `beforeExit` fallback for normal Node EOF. SIGKILL cannot run cleanup: discovery reaps an unavailable endpoint only after confirming its PID is dead. This is not a filesystem transaction or PID-reuse-proof lease.
 - **External scripts**: `PI_CROSS_MESSAGING_ENDPOINT` is deliberately not exported, overwritten, or cleared. Multiple SDK Hosts may share `process.env`; automatic export is deferred until it can be injected per Session into child processes. Existing session discovery and trusted Host EventBus RPC are unchanged.
 

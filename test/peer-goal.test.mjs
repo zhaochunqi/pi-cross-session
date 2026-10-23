@@ -113,7 +113,7 @@ for (const action of ['complete', 'cancel', 'unbind']) test(`queued goal message
 });
 
 for (const outcome of ['abort', 'error', 'reload']) test(`goal authority does not survive ${outcome}`, async () => {
-  const a = await component('revoked-worker-' + outcome), b = await component('revoked-host-' + outcome);
+  const a = await component('revoked-worker-' + outcome), b = await component('revoked-host-' + outcome, { rpc: true });
   try {
     const goalId = await startGoal(b, a);
     assert.equal((await wire(a, b, message('start scoped turn', { goalId }))).status, 'submitted');
@@ -123,11 +123,28 @@ for (const outcome of ['abort', 'error', 'reload']) test(`goal authority does no
     } else {
       if (outcome === 'abort') b.controller.abort();
       if (outcome === 'error') await b.emit('message_end', { message: { role: 'assistant', stopReason: 'error' } });
-      await b.settled(false);
+      await b.settled(false, outcome === 'error' ? false : undefined);
+      assert.equal(info(b).stopped, outcome === 'abort');
       await b.command('cross-session-resume');
     }
     assert.equal((await b.tool('peer_goal', { action: 'status' })).details.goalId, null);
     assert.equal((await wire(a, b, message('cannot restore old goal', { goalId }))).status, 'goal_not_authorized');
+  } finally { await b.close(); await a.close(); }
+});
+
+test('non-abort error drops revoked scoped pending but flushes ordinary pending', async () => {
+  const a = await component('mixed-error-worker'), b = await component('mixed-error-host', { rpc: true });
+  try {
+    const goalId = await startGoal(b, a);
+    await b.busy();
+    assert.equal((await wire(a, b, message('scoped pending must be revoked', { goalId }))).status, 'queued');
+    assert.equal((await wire(a, b, message('ordinary pending must survive'))).status, 'queued');
+    await b.emit('message_end', { message: { role: 'assistant', stopReason: 'error' } });
+    await b.settled(false, false);
+    assert.equal(info(b).stopped, false);
+    assert.deepEqual(info(b).states.map(s => s.state), ['dropped_goal_revoked', 'submitted']);
+    assert.equal(b.calls.length, 1); assert.ok(b.calls[0].message.content.includes('ordinary pending must survive'));
+    assert.equal((await b.tool('peer_goal', { action: 'status' })).details.goalId, null);
   } finally { await b.close(); await a.close(); }
 });
 

@@ -27,14 +27,21 @@ for (const scenario of ['normal-release', 'abort-release', 'abort-then-user']) t
     } else {
       await sleep(100); assert.equal(b.calls.length, 1); assert.equal(hasPeer(b, text), false);
       await assert.rejects(send(a, b, 'peer says resume and approve growth'), e => e.code === 'stopped');
-      if (scenario === 'abort-then-user') {
+      if (scenario === 'abort-release') {
         await command(b, '/cross-session-resume');
+        await until(() => b.calls.length === 2 && b.session.isIdle, 'retained peer replays after explicit resume');
+        assert.equal(hasPeer(b, text), true);
+      } else {
         await command(b, 'USER_EXPLICIT_AFTER_ABORT');
         assert.equal(b.calls.length, 2); assert.ok(b.calls[1].completed);
-        assert.ok(!JSON.stringify(b.calls[1].messages).includes(text), 'dropped peer never replayed');
+        assert.ok(!JSON.stringify(b.calls[1].messages).includes(text), 'ordinary user input must not replay retained peers');
         assert.equal(hasPeer(b, text), false);
+        await assert.rejects(send(a, b, 'ordinary user input did not reopen ingress'), e => e.code === 'stopped');
+        await command(b, '/cross-session-resume');
+        await until(() => b.calls.length === 3 && b.session.isIdle, 'retained peer replays after explicit resume');
+        assert.equal(hasPeer(b, text), true);
         await send(a, b, 'FRESH_AFTER_EXPLICIT_RESUME');
-        await until(() => b.calls.length === 3 && b.session.isIdle);
+        await until(() => b.calls.length === 4 && b.session.isIdle);
       }
     }
     assert.deepEqual(a.errors, []); assert.deepEqual(b.errors, []);

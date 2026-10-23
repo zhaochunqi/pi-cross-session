@@ -97,7 +97,7 @@ test('component: synchronous handler claim is exclusive; abort during admission 
     assert.equal((await wire(a, b, message('before abort'))).status, 'queued');
     const aborting = b.bus.on('cross-session:received', () => b.controller.abort());
     assert.equal((await wire(a, b, message('during abort'))).status, 'stopped'); aborting();
-    assert.deepEqual(info(b).states.slice(1).map(s => s.state), ['dropped_cancelled', 'dropped_cancelled']); assert.equal(b.calls.length, 0);
+    assert.deepEqual(info(b).states.slice(1).map(s => s.state), ['queued', 'dropped_cancelled']); assert.equal(b.calls.length, 0);
   } finally { await b.close(); await a.close(); }
 });
 

@@ -136,15 +136,34 @@ for (const scenario of ['coalesced-near-hello', 'fragmented-near-message', 'BOM-
   } finally { await b.close(); await a.close(); }
 });
 
-test('review component: unknown/toolUse/error ending drops queue; internal cancelled/peer continuations never gain tool authority', async () => {
+test('review component: explicit non-abort error/length keeps ingress open and flushes only queued successors', async () => {
+  for (const stopReason of ['error', 'length']) {
+    const a = await component('failure-a-' + stopReason), b = await component('failure-b-' + stopReason, { rpc: true });
+    try {
+      await b.busy(); assert.equal((await wire(a, b, message('retain ' + stopReason))).status, 'queued');
+      await b.emit('message_end', { message: { role: 'assistant', stopReason } });
+      await b.settled(false, false);
+      assert.equal(info(b).stopped, false); assert.equal(b.calls.length, 1);
+      assert.ok(b.calls[0].message.content.includes('retain ' + stopReason));
+      assert.equal(info(b).states[0].state, 'submitted');
+      await b.busy(); await b.settled(true, false);
+      assert.equal(b.calls.length, 1, 'the already-submitted turn is never replayed');
+    } finally { await b.close(); await a.close(); }
+  }
+});
+
+test('review component: unknown endings pause with retained queue; cancelled/peer continuations never gain tool authority', async () => {
   const a = await component('evidence-a'), b = await component('evidence-b', { rpc: true });
   try {
-    for (const stopReason of [undefined, 'toolUse', 'error', 'length']) {
-      await b.busy(); assert.equal((await wire(a, b, message('drop ' + stopReason))).status, 'queued');
+    for (const stopReason of [undefined, 'toolUse']) {
+      await b.busy(); assert.equal((await wire(a, b, message('pause ' + stopReason))).status, 'queued');
       if (stopReason) await b.emit('message_end', { message: { role: 'assistant', stopReason } });
-      await b.settled(false); assert.ok(info(b).stopped); assert.equal(b.calls.length, 0);
-      assert.ok(info(b).states.every(s => s.state === 'dropped_cancelled'));
-      await b.command('cross-session-resume');
+      const callsBefore = b.calls.length;
+      await b.settled(false); assert.ok(info(b).stopped); assert.equal(b.calls.length, callsBefore);
+      assert.equal(info(b).states.at(-1).state, 'queued');
+      await b.command('cross-session-resume'); await sleep(10);
+      assert.equal(b.calls.length, callsBefore + 1, 'explicit local resume replays the retained message');
+      await b.busy(); await b.settled();
     }
     // Explicit reopen starts a new peer turn, not the old cancelled authority.
     assert.equal((await wire(a, b, message('new peer after reopen'))).status, 'submitted');
@@ -154,7 +173,8 @@ test('review component: unknown/toolUse/error ending drops queue; internal cance
       for (const [toolName, input] of [['Agent', {}], ['send_subagent', { agent_id: 'fixture', message: 'x' }], ['mesh', { action: 'resume' }], ['mesh_control', { action: 'grow' }]]) assert.equal((await b.emit('tool_call', { toolName, input })).block, true);
     }
     assert.equal((await wire(a, b, message('queue after reopen'))).status, 'queued');
-    await b.settled(); assert.equal(b.calls.length, 2, 'new peer successful turn can flush, old cancelled flag does not poison it');
+    const callsBeforeFlush = b.calls.length;
+    await b.settled(); assert.equal(b.calls.length, callsBeforeFlush + 1, 'new peer successful turn can flush, old cancelled flag does not poison it');
     await b.emit('message_end', { message: { role: 'assistant', stopReason: 'aborted' } });
     await b.emit('agent_start'); assert.equal((await b.emit('tool_call', { toolName: 'Agent', input: {} })).block, true);
     await b.settled(false);

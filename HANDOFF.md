@@ -1,5 +1,7 @@
 # Cross-session core / Host RPC handoff
 
+> 本 fork 当前改动只涉及在线内存队列：普通 pending 不再有 queue TTL；abort 暂停但保留，显式 resume 串行重放；新 Pi 在 `agent_settled.aborted === false` 时允许 `error/length` 后继续，旧 SDK 保守暂停。goal 撤销仍删除 scoped pending。没有新增磁盘 spool，reload / shutdown / 进程退出后队列不恢复。下文保留上游验收记录；第 1 节已按本 fork 更新，历史测试数字不代表本 fork 最新结果。
+
 范围：只改 `pi-cross-session`。当前第二轮修复 **F1/F2 两项 P1 + 跨 SDK RPC 测试契约**，最终证据见第 7 节（待主审复核）；第 5/6 节保留历史批次证据，不代表当前 SDK 矩阵。基线 HEAD `d2eb1bc`，原仓库安装树 SDK **0.84.4**，另以 fresh 私有 source-hash fixture 验证已装 **0.83.0**，未改原版本声明或依赖。
 没有提交、push、stash、安装、联网、依赖版本变更、真实用户 session/peer/凭据访问；没有启动子代理。
 **Mesh Host adapter、映射、spool、权限 UI 与两份原报告均未修改。** 本文不是 Mesh 集成验收。
@@ -47,17 +49,17 @@ message = {
 
 ### 队列、取消和来源
 
-- 每 incarnation 最多 50 条待提交消息，TTL 至多 30s（同时受发送时间约束，未来 clock skew 最多 5s）。
-- 不再把 busy 消息交给 SDK steer：只在最近一次 low-level run 观测到 assistant `message_end.stopReason="stop"`、非取消、signal/来源已确认的 `agent_settled` 后，下一个 event-loop gate 重验 idle/epoch，再提交 **一条**。
+- 每 incarnation 最多 50 条待提交消息；pending 没有 queue TTL，但只存在内存中，reload/shutdown/进程退出即丢失。wire `sentAt` 仍要求 30s 内，未来 clock skew 最多 5s。
+- 不再把 busy 消息交给 SDK steer：通常在最近一次 low-level run 观测到 assistant `message_end.stopReason="stop"`、非取消、signal/来源已确认的 `agent_settled` 后，下一个 event-loop gate 重验 idle/epoch，再提交 **一条**。新 Pi 另可用 `agent_settled.aborted === false` 精确区分终止 `error/length`：撤销旧 turn 权限后继续下一条；旧 SDK 无此字段时保守暂停。
 - 从同步提交到 agent_start 的窗口设为 preflight，不能因 `isIdle()` 暂 true 把第二条漏入 SDK queue。
-- agent_start 捕获 signal 并注册 abort listener；signal abort 或 assistant aborted 证据都会 stop latch，并立刻丢弃未提交队列。unknown/internal abort 也保守 latch。
+- agent_start 捕获 signal 并注册 abort listener；signal abort 或 assistant aborted 证据都会 stop latch。普通未提交队列保留到显式 resume；unknown/internal abort 也保守 latch。goal 撤销仍通过 `revokeGoal` 删除 scoped pending。
 - admission 的同步受信事件回调后再次验证取消、incarnation 与同一 signal，覆盖 listener 内发生 abort 的重入。
-- 未确认 signal/来源的忙碌或 preflight 状态拒绝（不自动猜测执行）。error 会撤销终止成功资格，每次 low-level agent_start 都重新等待成功证据。错误/backoff 取消、缺失成功证据、toolUse/length 尾态或未知来源的 settled 均保守 latch/drop；实际 retry 后成功 stop 才可恢复该逻辑 turn 的安全 flush 资格。
-- 只有本地用户 `/cross-session-resume` 命令可以重新打开；需要 SDK idle 且无 active signal。普通用户 prompt、peer 文本、工具参数均不解锁收件；但 idle 后新的 genuine interactive/rpc 用户 turn 可正常使用自己的工具，不需要先重开 peer 收件。命令不重放 dropped，也不补充预算。
+- 未确认 signal/来源的忙碌或 preflight 状态拒绝（不自动猜测执行）。error 会撤销终止成功资格，每次 low-level agent_start 都重新等待成功证据。只有运行时明确给出 `aborted:false` 的终止 `error/length` 才不暂停收件；backoff 取消、缺失成功证据、toolUse 尾态、未知来源或旧 SDK 的模糊结束均保守 latch，普通 pending 留队而不自动重放。
+- 只有本地用户 `/cross-session-resume` 命令可以重新打开并重放普通 retained pending；需要 SDK idle 且无 active signal。普通用户 prompt、peer 文本、工具参数均不解锁收件；但 idle 后新的 genuine interactive/rpc 用户 turn 可正常使用自己的工具，不需要先重开 peer 收件。命令不补充预算，也不重放已 submitted 的工作。
 - 每 incarnation **共享 256 单位**收发预算：每次 inbound admission、每次 outbound exchange attempt 各扣一；桥接同样扣；agent_settled/resume 不补满。新 incarnation 才重置，绝不能由 adapter 自动 reload 来续预算。
 - per-sender token bucket 30 / refill 0.5s⁻¹；sender-qualified SHA-256 摘要 → admission 时间 Map 抑制同 sender 同文本 30s 内 A/B/A，不仅上一条；不随 settled 清空，最多 256 个 committed 摘要键，由总预算约束。
 - 去重键是 `authenticatedSenderInstanceId:messageId`；ID 在整个 receiver incarnation 保留，不因 30s 窗口到期重复注入。总预算保证状态有界（最多 256 条）。
-- admission 先保留 ID/额度再发受信事件；之后的 no_handler、SDK 同步失败、取消/TTL drop 不回滚到可自动重试状态。
+- admission 先保留 ID/额度再发受信事件；之后的 no_handler、SDK 同步失败、admission 取消或 goal 撤销 drop 不回滚到可自动重试状态。普通 pending 因 abort 暂停不算 drop。
 
 ### 有界可见状态 / 不确定收据
 
@@ -67,7 +69,7 @@ message = {
 { v:1, type:"status", requestId, messageId } // hello 后的第二帧
 // response.status / state:
 // unknown | accepted | queued | submitted | expired | dropped |
-// dropped_cancelled | dropped_shutdown | dropped_user_reset | injection_failed
+// dropped_cancelled | dropped_shutdown | dropped_goal_revoked | injection_failed
 ```
 
 status 查询不会消费消息预算，不可查询其他 sender 的消息。`unknown` 不表示未送达：重启/失联可能丢失整个内存状态。

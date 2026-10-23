@@ -24,7 +24,7 @@ export async function component(name, options = {}) {
     command: (name, args = '') => ext.commands.get(name).handler(args, ctx),
     tool: (name, params) => ext.tools.get(name).definition.execute(randomUUID(), params, undefined, undefined, ctx),
     async busy(source = 'interactive') { await emit('input', { source }); idle = false; this.controller = new AbortController(); ctx.signal = this.controller.signal; await emit('agent_start'); },
-    async settled(success = true) { if (success) await emit('message_end', { message: { role: 'assistant', stopReason: 'stop' } }); idle = true; await emit('agent_settled'); ctx.signal = undefined; await sleep(10); },
+    async settled(success = true, aborted) { if (success) await emit('message_end', { message: { role: 'assistant', stopReason: 'stop' } }); idle = true; await emit('agent_settled', aborted === undefined ? {} : { aborted }); ctx.signal = undefined; await sleep(10); },
     setIdle(value) { idle = value; },
     async close() { await emit('session_shutdown'); runtime.invalidate(); },
   };
