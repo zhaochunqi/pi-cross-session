@@ -179,3 +179,17 @@ Design docs (reverse-engineering of Claude Code v2.1.224–252, v1 audit, v2 arc
 ## License
 
 [MIT](./LICENSE)
+
+## 预算与队列上限（环境变量）
+
+入站/出站共享的 lifetime 预算与待处理队列上限是防失控兜底，真正的节流是速率限制器。
+默认值已按「一天派几十个子 agent 的 orchestrator 会话」调大（2026-10-24 实测旧值 256
+会让完成通知以 `budget_exhausted` 丢失）。可用环境变量覆盖：
+
+| 变量 | 默认 | 语义 |
+| --- | --- | --- |
+| `PI_CROSS_SESSION_BUDGET` | 2048 | 未 scoped 消息的终身预算（不可重试耗尽） |
+| `PI_CROSS_SESSION_MAX_PENDING` | 200 | 接收方正忙时的待处理队列上限（超出报 `queue_full`） |
+
+非法值（非整数 / 低于下限）回落默认，不报错。
+

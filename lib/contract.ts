@@ -81,3 +81,17 @@ export function requestRpc(bus: EventBus, topic: typeof RPC_SEND | typeof RPC_IN
     try { bus.emit(topic, request); } catch (error) { finish(error instanceof Error ? error : new Error(String(error))); }
   });
 }
+
+// Lifetime budgets and queue bounds exist as anti-runaway protection on top of the
+// rate limiter (RATE_*), not as the primary throttle. Orchestrator sessions that
+// legitimately fan out dozens of sub-agents exhaust the old hardcoded 256 fast
+// (observed 2026-10-24: completion messages dropped with budget_exhausted), so the
+// defaults are raised and both knobs are env-overridable without code edits.
+export function envInt(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= min ? parsed : fallback;
+}
+export const TOTAL_BUDGET = envInt("PI_CROSS_SESSION_BUDGET", 2048, 1);
+export const MAX_PENDING = envInt("PI_CROSS_SESSION_MAX_PENDING", 200, 1);
