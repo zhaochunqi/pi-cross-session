@@ -7,7 +7,7 @@ import { chmod, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "n
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { promisify, TextDecoder } from "node:util";
-import { CAPABILITY, RPC_SEND, RPC_INFO, RECEIVED, STEER_CAPABILITY, bridgeEnvelope, validId, validInstance, type Delivery, type SendRequest } from "../lib/contract";
+import { CAPABILITY, RPC_SEND, RPC_INFO, RECEIVED, STEER_CAPABILITY, bridgeEnvelope, validId, validInstance, TOTAL_BUDGET, MAX_PENDING, type Delivery, type SendRequest } from "../lib/contract";
 
 import { MESH_CONTINUATION, MeshContinuations } from "../lib/mesh-continuation";
 import { GOAL_ENTRY, PeerGoals } from "../lib/peer-goal";
@@ -19,8 +19,6 @@ const GOAL_CAPABILITY = "goal-scoped-peer-v1";
 const MAX_FRAME_BYTES = 1_048_576;
 const MAX_MESSAGE_CHARS = 1_000_000;
 const MAX_REGISTRATION_BYTES = 64 * 1024;
-const MAX_PENDING = 50;
-const TOTAL_BUDGET = 256;
 const MAX_MESSAGE_AGE_MS = 30_000;
 const MAX_TRACKED_SENDERS = 256;
 const MAX_SEEN_MESSAGES = 512;
